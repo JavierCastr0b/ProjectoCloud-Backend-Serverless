@@ -1,6 +1,6 @@
 service: madamtusan-backend
 org: javiercastro
-frameworkVersion: '3'
+frameworkVersion: '4'
 provider:
   name: aws
   runtime: python3.12
@@ -21,7 +21,7 @@ provider:
       Ref: OrderWorkflowStateMachine
     SNS_ORDERS_TOPIC_ARN:
       Ref: OrderNotificationsTopic
-    RAPPI_API_URL: ${env:RAPPI_API_URL}
+    RAPPI_API_URL: ${env:RAPPI_API_URL, ''}
     TENANT_ID: ${env:TENANT_ID, 'madamtusan'}
   iamRoleStatements:
     - Effect: Allow
