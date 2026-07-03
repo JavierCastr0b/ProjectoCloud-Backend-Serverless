@@ -344,14 +344,14 @@ resources:
               }
             - TaskHandlerArn: !GetAtt TaskHandlerLambdaFunction.Arn
 
-  OrderNotificationsTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: ${self:service}-orders-notifications-${sls:stage}
-      DisplayName: Order Notifications for ${self:service}
-      Subscription:
-        - Endpoint: ${env:ADMIN_EMAIL, 'admin@madamtusan.local'}
-          Protocol: email
+    OrderNotificationsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-orders-notifications-${sls:stage}
+        DisplayName: Order Notifications for ${self:service}
+        Subscription:
+          - Endpoint: ${env:ADMIN_EMAIL, 'admin@madamtusan.local'}
+            Protocol: email
 
   Outputs:
     OrderWorkflowStateMachineArn:
