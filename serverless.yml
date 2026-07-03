@@ -1,0 +1,359 @@
+service: madamtusan-backend
+org: javiercastro
+frameworkVersion: '3'
+provider:
+  name: aws
+  runtime: python3.12
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  memorySize: 1024
+  timeout: 29
+  iam:
+    role: arn:aws:iam::285023351044:role/LabRole
+  environment:
+    USERS_TABLE: ${self:service}-users-${sls:stage}
+    AUTH_TOKENS_TABLE: ${self:service}-auth-tokens-${sls:stage}
+    ORDERS_TABLE: ${self:service}-orders-${sls:stage}
+    EVENTS_TABLE: ${self:service}-order-events-${sls:stage}
+    PRODUCTS_TABLE: ${self:service}-products-${sls:stage}
+    S3_BUCKET: ${self:service}-assets-${sls:stage}-${aws:accountId}
+    ORDER_WORKFLOW_STATE_MACHINE_ARN:
+      Ref: OrderWorkflowStateMachine
+    SNS_ORDERS_TOPIC_ARN:
+      Ref: OrderNotificationsTopic
+    RAPPI_API_URL: ${env:RAPPI_API_URL}
+    TENANT_ID: ${env:TENANT_ID, 'madamtusan'}
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - dynamodb:PutItem
+        - dynamodb:GetItem
+        - dynamodb:Query
+        - dynamodb:UpdateItem
+        - dynamodb:DeleteItem
+        - dynamodb:Scan
+      Resource:
+        - arn:aws:dynamodb:${self:provider.region}:${aws:accountId}:table/${self:provider.environment.USERS_TABLE}
+        - arn:aws:dynamodb:${self:provider.region}:${aws:accountId}:table/${self:provider.environment.AUTH_TOKENS_TABLE}
+        - arn:aws:dynamodb:${self:provider.region}:${aws:accountId}:table/${self:provider.environment.ORDERS_TABLE}
+        - arn:aws:dynamodb:${self:provider.region}:${aws:accountId}:table/${self:provider.environment.EVENTS_TABLE}
+        - arn:aws:dynamodb:${self:provider.region}:${aws:accountId}:table/${self:provider.environment.PRODUCTS_TABLE}
+    - Effect: Allow
+      Action:
+        - s3:PutObject
+        - s3:GetObject
+        - s3:ListBucket
+        - s3:DeleteObject
+      Resource:
+        - arn:aws:s3:::${self:provider.environment.S3_BUCKET}
+        - arn:aws:s3:::${self:provider.environment.S3_BUCKET}/*
+    - Effect: Allow
+      Action:
+        - states:StartExecution
+        - states:SendTaskSuccess
+      Resource: "*"
+    - Effect: Allow
+      Action:
+        - sns:Publish
+        - sns:Subscribe
+      Resource: "*"
+    - Effect: Allow
+      Action:
+        - events:PutEvents
+      Resource: "*"
+
+functions:
+  registerUser:
+    handler: handler.register_user
+    events:
+      - httpApi:
+          path: /auth/register
+          method: post
+  login:
+    handler: handler.login
+    events:
+      - httpApi:
+          path: /auth/login
+          method: post
+  createUser:
+    handler: handler.create_user
+    events:
+      - httpApi:
+          path: /users
+          method: post
+  deleteUser:
+    handler: handler.delete_user
+    events:
+      - httpApi:
+          path: /users/{userId}
+          method: delete
+  updateProfile:
+    handler: handler.update_profile
+    events:
+      - httpApi:
+          path: /users/profile
+          method: put
+  subscribeEmail:
+    handler: handler.subscribe_email
+    events:
+      - httpApi:
+          path: /users/email-subscription
+          method: post
+  uploadAvatar:
+    handler: handler.upload_avatar
+    events:
+      - httpApi:
+          path: /users/avatar
+          method: post
+  createOrder:
+    handler: handler.create_order
+    events:
+      - httpApi:
+          path: /orders
+          method: post
+  listOrders:
+    handler: handler.list_orders
+    events:
+      - httpApi:
+          path: /orders
+          method: get
+  getOrder:
+    handler: handler.get_order
+    events:
+      - httpApi:
+          path: /orders/{orderId}
+          method: get
+  deleteOrder:
+    handler: handler.delete_order
+    events:
+      - httpApi:
+          path: /orders/{orderId}
+          method: delete
+  listProducts:
+    handler: handler.list_products
+    events:
+      - httpApi:
+          path: /products
+          method: get
+  getProduct:
+    handler: handler.get_product
+    events:
+      - httpApi:
+          path: /products/{productId}
+          method: get
+  taskCallback:
+    handler: handler.submit_task_callback
+    events:
+      - httpApi:
+          path: /tasks/callback
+          method: post
+  taskHandler:
+    handler: handler.task_handler
+  rappiNotifier:
+    handler: handler.rappi_notifier
+    events:
+      - eventBridge:
+          pattern:
+            source:
+              - "madamtusan.orders"
+            detail-type:
+              - "order.state.changed"
+
+resources:
+  Resources:
+    UsersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.USERS_TABLE}
+        AttributeDefinitions:
+          - AttributeName: tenant_user_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tenant_user_id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+
+    AuthTokensTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.AUTH_TOKENS_TABLE}
+        AttributeDefinitions:
+          - AttributeName: token
+            AttributeType: S
+        KeySchema:
+          - AttributeName: token
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+
+    OrdersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.ORDERS_TABLE}
+        AttributeDefinitions:
+          - AttributeName: order_id
+            AttributeType: S
+          - AttributeName: tenant_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: order_id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        GlobalSecondaryIndexes:
+          - IndexName: TenantIndex
+            KeySchema:
+              - AttributeName: tenant_id
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+
+    OrderEventsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.EVENTS_TABLE}
+        AttributeDefinitions:
+          - AttributeName: event_id
+            AttributeType: S
+          - AttributeName: tenant_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: event_id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        GlobalSecondaryIndexes:
+          - IndexName: TenantEventsIndex
+            KeySchema:
+              - AttributeName: tenant_id
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+
+    ProductsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.PRODUCTS_TABLE}
+        AttributeDefinitions:
+          - AttributeName: product_id
+            AttributeType: S
+          - AttributeName: category
+            AttributeType: S
+        KeySchema:
+          - AttributeName: product_id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        GlobalSecondaryIndexes:
+          - IndexName: CategoryIndex
+            KeySchema:
+              - AttributeName: category
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+
+    AssetsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.S3_BUCKET}
+
+    OrderWorkflowRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - states.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Policies:
+          - PolicyName: StepFunctionsInvokeLambda
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - lambda:InvokeFunction
+                  Resource:
+                    - !GetAtt TaskHandlerLambdaFunction.Arn
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: arn:aws:logs:*:*:*
+
+    OrderWorkflowStateMachine:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        StateMachineName: ${self:service}-workflow-${sls:stage}
+        RoleArn: !GetAtt OrderWorkflowRole.Arn
+        DefinitionString:
+          Fn::Sub:
+            - |
+              {
+                "Comment": "Madam Tusan order workflow",
+                "StartAt": "CookOrder",
+                "States": {
+                  "CookOrder": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                    "Parameters": {
+                      "FunctionName": "${TaskHandlerArn}",
+                      "Payload": {
+                        "taskToken.$": "$$.Task.Token",
+                        "order.$": "$.order",
+                        "workflow_step": "COOK"
+                      }
+                    },
+                    "Next": "PackOrder"
+                  },
+                  "PackOrder": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                    "Parameters": {
+                      "FunctionName": "${TaskHandlerArn}",
+                      "Payload": {
+                        "taskToken.$": "$$.Task.Token",
+                        "order.$": "$.order",
+                        "workflow_step": "PACK"
+                      }
+                    },
+                    "Next": "DeliverOrder"
+                  },
+                  "DeliverOrder": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                    "Parameters": {
+                      "FunctionName": "${TaskHandlerArn}",
+                      "Payload": {
+                        "taskToken.$": "$$.Task.Token",
+                        "order.$": "$.order",
+                        "workflow_step": "DELIVER"
+                      }
+                    },
+                    "Next": "CompleteOrder"
+                  },
+                  "CompleteOrder": {
+                    "Type": "Pass",
+                    "Result": {
+                      "status": "COMPLETED"
+                    },
+                    "End": true
+                  }
+                }
+              }
+            - TaskHandlerArn: !GetAtt TaskHandlerLambdaFunction.Arn
+
+  OrderNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ${self:service}-orders-notifications-${sls:stage}
+      DisplayName: Order Notifications for ${self:service}
+      Subscription:
+        - Endpoint: ${env:ADMIN_EMAIL, 'admin@madamtusan.local'}
+          Protocol: email
+
+  Outputs:
+    OrderWorkflowStateMachineArn:
+      Value:
+        Ref: OrderWorkflowStateMachine

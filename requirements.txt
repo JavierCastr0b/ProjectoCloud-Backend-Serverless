@@ -1,0 +1,2 @@
+# No additional Python packages are required for AWS Lambda because boto3 is bundled.
+# If you want to add local dependencies, list them here.
