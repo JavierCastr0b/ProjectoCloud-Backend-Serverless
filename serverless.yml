@@ -276,40 +276,11 @@ resources:
       Properties:
         BucketName: ${self:provider.environment.S3_BUCKET}
 
-    OrderWorkflowRole:
-      Type: AWS::IAM::Role
-      Properties:
-        AssumeRolePolicyDocument:
-          Version: '2012-10-17'
-          Statement:
-            - Effect: Allow
-              Principal:
-                Service:
-                  - states.amazonaws.com
-              Action:
-                - sts:AssumeRole
-        Policies:
-          - PolicyName: StepFunctionsInvokeLambda
-            PolicyDocument:
-              Version: '2012-10-17'
-              Statement:
-                - Effect: Allow
-                  Action:
-                    - lambda:InvokeFunction
-                  Resource:
-                    - !GetAtt TaskHandlerLambdaFunction.Arn
-                - Effect: Allow
-                  Action:
-                    - logs:CreateLogGroup
-                    - logs:CreateLogStream
-                    - logs:PutLogEvents
-                  Resource: arn:aws:logs:*:*:*
-
     OrderWorkflowStateMachine:
       Type: AWS::StepFunctions::StateMachine
       Properties:
         StateMachineName: ${self:service}-workflow-${sls:stage}
-        RoleArn: !GetAtt OrderWorkflowRole.Arn
+        RoleArn: arn:aws:iam::${aws:accountId}:role/LabRole
         DefinitionString:
           Fn::Sub:
             - |
