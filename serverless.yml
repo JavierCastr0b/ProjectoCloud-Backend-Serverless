@@ -281,62 +281,59 @@ resources:
       Properties:
         StateMachineName: ${self:service}-workflow-${sls:stage}
         RoleArn: arn:aws:iam::${aws:accountId}:role/LabRole
-        DefinitionString:
-          Fn::Sub:
-            - |
-              {
-                "Comment": "Madam Tusan order workflow",
-                "StartAt": "CookOrder",
-                "States": {
-                  "CookOrder": {
-                    "Type": "Task",
-                    "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
-                    "Parameters": {
-                      "FunctionName": "${TaskHandlerArn}",
-                      "Payload": {
-                        "taskToken.$": "$$.Task.Token",
-                        "order.$": "$.order",
-                        "workflow_step": "COOK"
-                      }
-                    },
-                    "Next": "PackOrder"
-                  },
-                  "PackOrder": {
-                    "Type": "Task",
-                    "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
-                    "Parameters": {
-                      "FunctionName": "${TaskHandlerArn}",
-                      "Payload": {
-                        "taskToken.$": "$$.Task.Token",
-                        "order.$": "$.order",
-                        "workflow_step": "PACK"
-                      }
-                    },
-                    "Next": "DeliverOrder"
-                  },
-                  "DeliverOrder": {
-                    "Type": "Task",
-                    "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
-                    "Parameters": {
-                      "FunctionName": "${TaskHandlerArn}",
-                      "Payload": {
-                        "taskToken.$": "$$.Task.Token",
-                        "order.$": "$.order",
-                        "workflow_step": "DELIVER"
-                      }
-                    },
-                    "Next": "CompleteOrder"
-                  },
-                  "CompleteOrder": {
-                    "Type": "Pass",
-                    "Result": {
-                      "status": "COMPLETED"
-                    },
-                    "End": true
+        DefinitionString: |
+          {
+            "Comment": "Madam Tusan order workflow",
+            "StartAt": "CookOrder",
+            "States": {
+              "CookOrder": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                "Parameters": {
+                  "FunctionName": "madamtusan-backend-dev-taskHandler",
+                  "Payload": {
+                    "taskToken.$": "$$.Task.Token",
+                    "order.$": "$.order",
+                    "workflow_step": "COOK"
                   }
-                }
+                },
+                "Next": "PackOrder"
+              },
+              "PackOrder": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                "Parameters": {
+                  "FunctionName": "madamtusan-backend-dev-taskHandler",
+                  "Payload": {
+                    "taskToken.$": "$$.Task.Token",
+                    "order.$": "$.order",
+                    "workflow_step": "PACK"
+                  }
+                },
+                "Next": "DeliverOrder"
+              },
+              "DeliverOrder": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                "Parameters": {
+                  "FunctionName": "madamtusan-backend-dev-taskHandler",
+                  "Payload": {
+                    "taskToken.$": "$$.Task.Token",
+                    "order.$": "$.order",
+                    "workflow_step": "DELIVER"
+                  }
+                },
+                "Next": "CompleteOrder"
+              },
+              "CompleteOrder": {
+                "Type": "Pass",
+                "Result": {
+                  "status": "COMPLETED"
+                },
+                "End": true
               }
-            - TaskHandlerArn: !GetAtt TaskHandlerLambdaFunction.Arn
+            }
+          }
 
     OrderNotificationsTopic:
       Type: AWS::SNS::Topic
