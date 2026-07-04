@@ -23,36 +23,7 @@ Desplegado con **Serverless Framework v4**.
 
 ## Arquitectura y flujo de eventos
 
-```
-Cliente (app web)  ─┐
-                     ├─> POST /orders ───────────┐
-API externa (Rappi) ─┘  POST /integrations/      │
-                         rappi/orders             │
-                                                   v
-                                        DynamoDB (OrdersTable)
-                                          + S3 (orders/{id}.json)
-                                                   │
-                                                   v
-                                   EventBridge: "order.created"
-                                                   │
-                                                   v
-                                      Lambda startWorkflow
-                                                   │
-                                                   v
-                              Step Functions: CookOrder -> PackOrder
-                              -> DeliverOrder -> ReceiveOrder -> Succeed
-                              (cada paso espera un Task Token humano)
-                                                   │
-                       cada paso publica  EventBridge: "order.state.changed"
-                                                   │
-                                        ┌──────────┴──────────┐
-                                        v                      v
-                          DynamoDB (OrderEventsTable)   Lambda rappiNotifier
-                          (historial/auditoría)         (solo si source=rappi)
-                                                                 │
-                                                                 v
-                                                   POST a RAPPI_API_URL (otra nube)
-```
+![Arquitectura y flujo de eventos del pedido](flujo-de-eventos-pedido.jpg)
 
 ## Lambdas
 
