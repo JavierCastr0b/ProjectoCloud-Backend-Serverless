@@ -22,6 +22,7 @@ provider:
         - X-Api-Key
         - X-Amz-Security-Token
         - X-Amz-User-Agent
+        - X-Rappi-Secret
   iam:
     role: arn:aws:iam::285023351044:role/LabRole
   environment:
@@ -36,6 +37,7 @@ provider:
     SNS_ORDERS_TOPIC_ARN:
       Ref: OrderNotificationsTopic
     RAPPI_API_URL: ${env:RAPPI_API_URL, ''}
+    RAPPI_SHARED_SECRET: ${env:RAPPI_SHARED_SECRET, ''}
     TENANT_ID: ${env:TENANT_ID, 'madamtusan'}
   iamRoleStatements:
     - Effect: Allow
@@ -103,6 +105,12 @@ functions:
       - httpApi:
           path: /users
           method: post
+  listUsers:
+    handler: handler.list_users
+    events:
+      - httpApi:
+          path: /users
+          method: get
   deleteUser:
     handler: handler.delete_user
     events:
@@ -132,6 +140,18 @@ functions:
     events:
       - httpApi:
           path: /orders
+          method: post
+  createRappiOrder:
+    handler: handler.create_rappi_order
+    events:
+      - httpApi:
+          path: /integrations/rappi/orders
+          method: post
+  confirmRappiReceived:
+    handler: handler.confirm_rappi_received
+    events:
+      - httpApi:
+          path: /integrations/rappi/orders/{orderId}/receive
           method: post
   listOrders:
     handler: handler.list_orders
@@ -177,6 +197,17 @@ functions:
           method: post
   taskHandler:
     handler: handler.task_handler
+  startWorkflow:
+    handler: handler.start_workflow
+    events:
+      - eventBridge:
+          pattern:
+            source:
+              - "madamtusan.orders"
+            detail-type:
+              - "order.created"
+  workflowFailure:
+    handler: handler.mark_workflow_failed
   rappiNotifier:
     handler: handler.rappi_notifier
     events:
@@ -288,52 +319,121 @@ resources:
         RoleArn: arn:aws:iam::${aws:accountId}:role/LabRole
         DefinitionString: |
           {
-            "Comment": "Madam Tusan order workflow",
+            "Comment": "Madam Tusan workflow with human callbacks, retries and timeouts",
             "StartAt": "CookOrder",
             "States": {
               "CookOrder": {
                 "Type": "Task",
                 "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
                 "Parameters": {
-                  "FunctionName": "madamtusan-backend-dev-taskHandler",
+                  "FunctionName": "${self:service}-${sls:stage}-taskHandler",
                   "Payload": {
                     "taskToken.$": "$$.Task.Token",
                     "order.$": "$.order",
                     "workflow_step": "COOK"
                   }
                 },
+                "TimeoutSeconds": 3600,
+                "Retry": [{
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }],
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.workflow_error",
+                  "Next": "RecordFailure"
+                }],
                 "Next": "PackOrder"
               },
               "PackOrder": {
                 "Type": "Task",
                 "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
                 "Parameters": {
-                  "FunctionName": "madamtusan-backend-dev-taskHandler",
+                  "FunctionName": "${self:service}-${sls:stage}-taskHandler",
                   "Payload": {
                     "taskToken.$": "$$.Task.Token",
                     "order.$": "$.order",
                     "workflow_step": "PACK"
                   }
                 },
+                "TimeoutSeconds": 3600,
+                "Retry": [{
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }],
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.workflow_error",
+                  "Next": "RecordFailure"
+                }],
                 "Next": "DeliverOrder"
               },
               "DeliverOrder": {
                 "Type": "Task",
                 "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
                 "Parameters": {
-                  "FunctionName": "madamtusan-backend-dev-taskHandler",
+                  "FunctionName": "${self:service}-${sls:stage}-taskHandler",
                   "Payload": {
                     "taskToken.$": "$$.Task.Token",
                     "order.$": "$.order",
                     "workflow_step": "DELIVER"
                   }
                 },
+                "TimeoutSeconds": 3600,
+                "Retry": [{
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }],
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.workflow_error",
+                  "Next": "RecordFailure"
+                }],
+                "Next": "ReceiveOrder"
+              },
+              "ReceiveOrder": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+                "Parameters": {
+                  "FunctionName": "${self:service}-${sls:stage}-taskHandler",
+                  "Payload": {
+                    "taskToken.$": "$$.Task.Token",
+                    "order.$": "$.order",
+                    "workflow_step": "RECEIVE"
+                  }
+                },
+                "TimeoutSeconds": 3600,
+                "Retry": [{
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }],
+                "Catch": [{
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.workflow_error",
+                  "Next": "RecordFailure"
+                }],
                 "Next": "CompleteOrder"
               },
               "CompleteOrder": {
-                "Type": "Pass",
-                "Result": {
-                  "status": "COMPLETED"
+                "Type": "Succeed"
+              },
+              "RecordFailure": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${self:service}-${sls:stage}-workflowFailure",
+                  "Payload": {
+                    "order.$": "$.order",
+                    "workflow_error.$": "$.workflow_error"
+                  }
                 },
                 "End": true
               }

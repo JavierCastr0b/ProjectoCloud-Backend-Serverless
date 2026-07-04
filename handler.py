@@ -1,15 +1,16 @@
 import json
 import os
-import time
 import uuid
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import Decimal
 from http import HTTPStatus
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import boto3
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 
 from utils import (
     generate_secure_token,
@@ -37,6 +38,7 @@ S3_BUCKET = os.environ["S3_BUCKET"]
 SNS_ORDERS_TOPIC_ARN = os.environ.get("SNS_ORDERS_TOPIC_ARN", "")
 STATE_MACHINE_ARN = os.environ["ORDER_WORKFLOW_STATE_MACHINE_ARN"]
 RAPPI_API_URL = os.environ.get("RAPPI_API_URL", "")
+RAPPI_SHARED_SECRET = os.environ.get("RAPPI_SHARED_SECRET", "")
 DEFAULT_TENANT = os.environ.get("TENANT_ID", "madamtusan")
 
 users_table = dynamodb.Table(USERS_TABLE)
@@ -45,13 +47,53 @@ orders_table = dynamodb.Table(ORDERS_TABLE)
 events_table = dynamodb.Table(EVENTS_TABLE)
 products_table = dynamodb.Table(PRODUCTS_TABLE)
 
+STAFF_ROLES = {"worker", "cook", "pack", "deliverer", "admin"}
+REQUIRED_ROLE_BY_STEP = {
+    "COOK": "cook",
+    "PACK": "pack",
+    "DELIVER": "deliverer",
+    "RECEIVE": "customer",
+}
+
 
 def _build_user_key(tenant_id, user_id):
     return f"{tenant_id}#{user_id}"
 
 
 def _now_iso():
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _duration_seconds(started_at, completed_at):
+    start = _parse_iso(started_at)
+    end = _parse_iso(completed_at)
+    if not start or not end:
+        return None
+    return max(0, int((end - start).total_seconds()))
+
+
+def _normalize_order_items(items):
+    normalized = []
+    for item in items:
+        normalized_item = dict(item)
+        if "price" in normalized_item:
+            normalized_item["price"] = Decimal(str(normalized_item["price"]))
+        if "quantity" in normalized_item:
+            normalized_item["quantity"] = int(normalized_item["quantity"])
+        normalized.append(normalized_item)
+    return normalized
+
+
+def _json_decimal(value):
+    if isinstance(value, Decimal):
+        return int(value) if value % 1 == 0 else float(value)
+    raise TypeError(f"Cannot serialize {type(value).__name__}")
 
 
 def _publish_event(detail_type, detail):
@@ -84,8 +126,20 @@ def _is_admin(payload):
     return payload.get("role") == "admin"
 
 
-def _prompt_unauthorized():
-    return response(HTTPStatus.UNAUTHORIZED, {"message": "Unauthorized"})
+def _is_staff(payload):
+    return payload.get("role") in STAFF_ROLES
+
+
+def _can_complete_step(auth_payload, order, step):
+    role = auth_payload.get("role")
+    required_role = REQUIRED_ROLE_BY_STEP.get(step)
+    if not required_role:
+        return False
+    if role == "admin":
+        return True
+    if step == "RECEIVE":
+        return role == "customer" and order.get("created_by") == auth_payload.get("user_id")
+    return role == required_role or role == "worker"
 
 
 def authenticate(event):
@@ -210,6 +264,33 @@ def create_user(event, context):
         return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
 
 
+def list_users(event, context):
+    try:
+        auth_payload = authenticate(event)
+        if not _is_admin(auth_payload):
+            return response(HTTPStatus.FORBIDDEN, {"message": "Admin privileges required"})
+
+        tenant_id = auth_payload["tenant_id"]
+        result = users_table.scan(
+            FilterExpression="tenant_id = :tenant",
+            ExpressionAttributeValues={":tenant": tenant_id},
+        )
+        users = []
+        for item in result.get("Items", []):
+            safe_user = {
+                key: value
+                for key, value in item.items()
+                if key not in {"password_hash", "tenant_user_id"}
+            }
+            users.append(safe_user)
+        users.sort(key=lambda user: (user.get("role", ""), user.get("user_id", "")))
+        return response(HTTPStatus.OK, {"users": users, "count": len(users)})
+    except ValueError as exc:
+        return response(HTTPStatus.UNAUTHORIZED, {"message": str(exc)})
+    except Exception as exc:
+        return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+
+
 def delete_user(event, context):
     try:
         auth_payload = authenticate(event)
@@ -326,64 +407,139 @@ def update_profile(event, context):
         return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
 
 
+def _create_order_record(tenant_id, user_id, source, items):
+    if not items:
+        raise ValueError("Order items are required")
+
+    items = _normalize_order_items(items)
+    created_at = _now_iso()
+    order_id = str(uuid.uuid4())
+    order = {
+        "order_id": order_id,
+        "tenant_id": tenant_id,
+        "created_by": user_id,
+        "source": source.lower(),
+        "is_rappi": source.lower() == "rappi",
+        "status": "RECEIVED",
+        "workflow_step": "RECEIVED",
+        "task_token": None,
+        "items": items,
+        "history": [
+            {
+                "event": "CREATED",
+                "timestamp": created_at,
+                "status": "RECEIVED",
+                "step": "ORDER_CREATED",
+                "actor": user_id,
+            }
+        ],
+        "created_at": created_at,
+    }
+
+    orders_table.put_item(Item=order)
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=f"orders/{order_id}.json",
+        Body=json.dumps(order, default=_json_decimal).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+    event_detail = {
+        "tenant_id": tenant_id,
+        "order_id": order_id,
+        "status": "RECEIVED",
+        "step": "ORDER_CREATED",
+        "source": order["source"],
+    }
+    # EventBridge inicia el workflow y, en paralelo, registra el primer estado.
+    _publish_event("order.created", event_detail)
+    _publish_event("order.state.changed", event_detail)
+    _send_order_notification(tenant_id, user_id, order_id, items)
+    return order
+
+
 def create_order(event, context):
     try:
         auth_payload = authenticate(event)
         body = json_body(event)
-        tenant_id = auth_payload["tenant_id"]
-        user_id = auth_payload["user_id"]
-        source = body.get("source", "web")
-        items = body.get("items", [])
-        if not items:
-            return response(HTTPStatus.BAD_REQUEST, {"message": "Order items are required"})
-
-        order_id = str(uuid.uuid4())
-        order = {
-            "order_id": order_id,
-            "tenant_id": tenant_id,
-            "created_by": user_id,
-            "source": source,
-            "is_rappi": source.lower() == "rappi",
-            "status": "RECEIVED",
-            "workflow_step": "RECEIVED",
-            "task_token": None,
-            "items": items,
-            "history": [
-                {
-                    "timestamp": _now_iso(),
-                    "status": "RECEIVED",
-                    "step": "ORDER_CREATED",
-                    "actor": user_id,
-                }
-            ],
-            "created_at": _now_iso(),
-        }
-
-        orders_table.put_item(Item=order)
-        s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=f"orders/{order_id}.json",
-            Body=json.dumps(order).encode("utf-8"),
-            ContentType="application/json",
+        order = _create_order_record(
+            tenant_id=auth_payload["tenant_id"],
+            user_id=auth_payload["user_id"],
+            source=body.get("source", "web"),
+            items=body.get("items", []),
         )
-
-        _publish_event("order.state.changed", {"tenant_id": tenant_id, "order_id": order_id, "status": "RECEIVED", "step": "ORDER_CREATED", "source": source})
-
-        _send_order_notification(tenant_id, user_id, order_id, items)
-
-        sf.start_execution(
-            stateMachineArn=STATE_MACHINE_ARN,
-            name=f"order-{order_id}-{int(time.time())}",
-            input=json.dumps({"order": order}),
+        return response(
+            HTTPStatus.CREATED,
+            {
+                "order_id": order["order_id"],
+                "message": "Order created; EventBridge will start the workflow",
+            },
         )
-
-        return response(HTTPStatus.CREATED, {"order_id": order_id, "message": "Order created and workflow started"})
     except ValueError as exc:
-        return response(HTTPStatus.UNAUTHORIZED, {"message": str(exc)})
-    except KeyError as exc:
-        return response(HTTPStatus.BAD_REQUEST, {"message": f"Missing field: {exc.args[0]}"})
+        message = str(exc)
+        status = HTTPStatus.UNAUTHORIZED if "token" in message.lower() else HTTPStatus.BAD_REQUEST
+        return response(status, {"message": message})
     except Exception as exc:
         return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+
+
+def create_rappi_order(event, context):
+    """Entrada dedicada para la API #1 desplegada en la segunda nube."""
+    try:
+        provided_secret = (event.get("headers") or {}).get("x-rappi-secret") or (
+            event.get("headers") or {}
+        ).get("X-Rappi-Secret")
+        if not RAPPI_SHARED_SECRET or provided_secret != RAPPI_SHARED_SECRET:
+            return response(HTTPStatus.UNAUTHORIZED, {"message": "Invalid Rappi secret"})
+
+        body = json_body(event)
+        order = _create_order_record(
+            tenant_id=body.get("tenant_id", DEFAULT_TENANT),
+            user_id=body.get("customer_id", "rappi"),
+            source="rappi",
+            items=body.get("items", []),
+        )
+        return response(
+            HTTPStatus.CREATED,
+            {"order_id": order["order_id"], "message": "Rappi order accepted"},
+        )
+    except ValueError as exc:
+        return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+    except Exception as exc:
+        return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+
+
+def start_workflow(event, context):
+    """Consumidor EventBridge idempotente que inicia Step Functions."""
+    detail = event.get("detail") or {}
+    order_id = detail.get("order_id")
+    tenant_id = detail.get("tenant_id")
+    if not order_id or not tenant_id:
+        raise ValueError("Missing order_id or tenant_id in order.created event")
+
+    result = orders_table.get_item(Key={"order_id": order_id})
+    order = result.get("Item")
+    if not order or order.get("tenant_id") != tenant_id:
+        raise ValueError("Order not found for workflow")
+
+    workflow_input = {
+        "order": {
+            "order_id": order_id,
+            "tenant_id": tenant_id,
+            "created_by": order.get("created_by", ""),
+            "source": order.get("source", "web"),
+        }
+    }
+    try:
+        sf.start_execution(
+            stateMachineArn=STATE_MACHINE_ARN,
+            name=f"order-{order_id}",
+            input=json.dumps(workflow_input),
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ExecutionAlreadyExists":
+            raise
+    return {"message": "Workflow started", "order_id": order_id}
 
 
 def list_orders(event, context):
@@ -394,7 +550,16 @@ def list_orders(event, context):
             IndexName="TenantIndex",
             KeyConditionExpression=Key("tenant_id").eq(tenant_id),
         )
-        return response(HTTPStatus.OK, {"orders": result.get("Items", [])})
+        orders = result.get("Items", [])
+        if auth_payload.get("role") == "customer":
+            orders = [
+                order
+                for order in orders
+                if order.get("created_by") == auth_payload.get("user_id")
+            ]
+        # FIFO: los más antiguos se atienden y muestran primero.
+        orders.sort(key=lambda order: order.get("created_at", ""))
+        return response(HTTPStatus.OK, {"orders": orders})
     except ValueError as exc:
         return response(HTTPStatus.UNAUTHORIZED, {"message": str(exc)})
     except Exception as exc:
@@ -409,6 +574,11 @@ def get_order(event, context):
         result = orders_table.get_item(Key={"order_id": order_id})
         order = result.get("Item")
         if not order or order.get("tenant_id") != tenant_id:
+            return response(HTTPStatus.NOT_FOUND, {"message": "Order not found"})
+        if (
+            auth_payload.get("role") == "customer"
+            and order.get("created_by") != auth_payload.get("user_id")
+        ):
             return response(HTTPStatus.NOT_FOUND, {"message": "Order not found"})
         return response(HTTPStatus.OK, {"order": order})
     except ValueError as exc:
@@ -458,10 +628,13 @@ def task_handler(event, context):
     if not task_token or not order_id or not tenant_id:
         raise ValueError("Missing taskToken, order_id or tenant_id")
 
+    started_at = _now_iso()
+    required_role = REQUIRED_ROLE_BY_STEP.get(workflow_step, "worker")
     orders_table.update_item(
         Key={"order_id": order_id},
         UpdateExpression=(
             "SET task_token = :token, workflow_step = :step, #status = :status, "
+            "current_stage_started_at = :started_at, required_role = :required_role, "
             "history = list_append(if_not_exists(history, :empty_list), :history_item)"
         ),
         ExpressionAttributeNames={"#status": "status"},
@@ -469,12 +642,17 @@ def task_handler(event, context):
             ":token": task_token,
             ":step": workflow_step,
             ":status": f"WAITING_{workflow_step}",
+            ":started_at": started_at,
+            ":required_role": required_role,
             ":history_item": [
                 {
-                    "timestamp": _now_iso(),
+                    "event": "STARTED",
+                    "timestamp": started_at,
+                    "started_at": started_at,
                     "status": f"WAITING_{workflow_step}",
                     "step": workflow_step,
                     "actor": "system",
+                    "required_role": required_role,
                 }
             ],
             ":empty_list": [],
@@ -489,10 +667,88 @@ def task_handler(event, context):
             "status": f"WAITING_{workflow_step}",
             "step": workflow_step,
             "source": order.get("source"),
+            "required_role": required_role,
+            "started_at": started_at,
         },
     )
 
     return {"message": "Task token stored", "order_id": order_id}
+
+
+def _complete_active_step(order, actor):
+    task_token = order.get("task_token")
+    if not task_token:
+        raise ValueError("Order has no active task token")
+
+    order_id = order["order_id"]
+    tenant_id = order["tenant_id"]
+    step = order.get("workflow_step", "UNKNOWN")
+    started_at = order.get("current_stage_started_at")
+    completed_at = _now_iso()
+    duration_seconds = _duration_seconds(started_at, completed_at)
+    status = "COMPLETED" if step == "RECEIVE" else f"{step}_COMPLETED"
+    history_item = {
+        "event": "COMPLETED",
+        "timestamp": completed_at,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "status": status,
+        "step": step,
+        "actor": actor,
+    }
+    if duration_seconds is not None:
+        history_item["duration_seconds"] = duration_seconds
+
+    orders_table.update_item(
+        Key={"order_id": order_id},
+        UpdateExpression=(
+            "SET task_token = :null, workflow_step = :step, #status = :status, "
+            "current_stage_completed_at = :completed_at, "
+            "history = list_append(if_not_exists(history, :empty_list), :history_item)"
+        ),
+        ExpressionAttributeNames={"#status": "status"},
+        ExpressionAttributeValues={
+            ":null": None,
+            ":step": step,
+            ":status": status,
+            ":completed_at": completed_at,
+            ":history_item": [history_item],
+            ":empty_list": [],
+            ":active_token": task_token,
+            ":expected_step": step,
+        },
+        ConditionExpression="task_token = :active_token AND workflow_step = :expected_step",
+    )
+    _publish_event(
+        "order.state.changed",
+        {
+            "tenant_id": tenant_id,
+            "order_id": order_id,
+            "status": status,
+            "step": step,
+            "worker_id": actor,
+            "source": order.get("source", "web"),
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "duration_seconds": duration_seconds,
+        },
+    )
+    sf.send_task_success(
+        taskToken=task_token,
+        output=json.dumps(
+            {
+                "order": {
+                    "order_id": order_id,
+                    "tenant_id": tenant_id,
+                    "status": status,
+                    "workflow_step": step,
+                    "source": order.get("source", "web"),
+                    "created_by": order.get("created_by", ""),
+                }
+            }
+        ),
+    )
+    return status
 
 
 def submit_task_callback(event, context):
@@ -501,66 +757,108 @@ def submit_task_callback(event, context):
         body = json_body(event)
         tenant_id = auth_payload["tenant_id"]
         order_id = body["order_id"]
-        task_token = body["taskToken"]
-        worker_id = body.get("worker_id", auth_payload["user_id"])
-        step = body.get("workflow_step", "UNKNOWN")
-        status = body.get("status", "COMPLETED")
 
-        orders_table.update_item(
-            Key={"order_id": order_id},
-            UpdateExpression=(
-                "SET task_token = :null, workflow_step = :step, #status = :status, "
-                "history = list_append(if_not_exists(history, :empty_list), :history_item)"
-            ),
-            ExpressionAttributeNames={"#status": "status"},
-            ExpressionAttributeValues={
-                ":null": None,
-                ":step": step,
-                ":status": status,
-                ":history_item": [
-                    {
-                        "timestamp": _now_iso(),
-                        "status": status,
-                        "step": step,
-                        "actor": worker_id,
-                    }
-                ],
-                ":empty_list": [],
-            },
+        order_result = orders_table.get_item(Key={"order_id": order_id})
+        order = order_result.get("Item")
+        if not order or order.get("tenant_id") != tenant_id:
+            return response(HTTPStatus.NOT_FOUND, {"message": "Order not found"})
+
+        provided_task_token = body.get("taskToken") or body.get("task_token")
+        if provided_task_token and provided_task_token != order.get("task_token"):
+            return response(HTTPStatus.CONFLICT, {"message": "Stale task token"})
+        if not order.get("task_token"):
+            return response(HTTPStatus.CONFLICT, {"message": "Order has no active task token"})
+
+        step = order.get("workflow_step", "UNKNOWN")
+        if not _can_complete_step(auth_payload, order, step):
+            return response(
+                HTTPStatus.FORBIDDEN,
+                {"message": f"Role {auth_payload.get('role')} cannot complete step {step}"},
+            )
+
+        status = _complete_active_step(order, auth_payload["user_id"])
+        return response(
+            HTTPStatus.OK,
+            {"message": "Task callback accepted", "status": status},
         )
-
-        _publish_event(
-            "order.state.changed",
-            {
-                "tenant_id": tenant_id,
-                "order_id": order_id,
-                "status": status,
-                "step": step,
-                "worker_id": worker_id,
-            },
-        )
-
-        sf.send_task_success(
-            taskToken=task_token,
-            output=json.dumps(
-                {
-                    "order": {
-                        "order_id": order_id,
-                        "tenant_id": tenant_id,
-                        "status": status,
-                        "workflow_step": step,
-                    }
-                }
-            ),
-        )
-
-        return response(HTTPStatus.OK, {"message": "Task callback accepted"})
     except ValueError as exc:
-        return response(HTTPStatus.UNAUTHORIZED, {"message": str(exc)})
+        return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
     except KeyError as exc:
         return response(HTTPStatus.BAD_REQUEST, {"message": f"Missing field: {exc.args[0]}"})
     except Exception as exc:
         return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+
+
+def confirm_rappi_received(event, context):
+    """Permite que la API de origen simule la recepción del cliente Rappi."""
+    try:
+        headers = event.get("headers") or {}
+        provided_secret = headers.get("x-rappi-secret") or headers.get("X-Rappi-Secret")
+        if not RAPPI_SHARED_SECRET or provided_secret != RAPPI_SHARED_SECRET:
+            return response(HTTPStatus.UNAUTHORIZED, {"message": "Invalid Rappi secret"})
+
+        order_id = event["pathParameters"]["orderId"]
+        result = orders_table.get_item(Key={"order_id": order_id})
+        order = result.get("Item")
+        if not order or order.get("source") != "rappi":
+            return response(HTTPStatus.NOT_FOUND, {"message": "Rappi order not found"})
+        if order.get("workflow_step") != "RECEIVE" or not order.get("task_token"):
+            return response(
+                HTTPStatus.CONFLICT,
+                {"message": "Rappi order is not waiting for customer receipt"},
+            )
+
+        status = _complete_active_step(order, order.get("created_by", "rappi-customer"))
+        return response(HTTPStatus.OK, {"message": "Receipt confirmed", "status": status})
+    except Exception as exc:
+        return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+
+
+def mark_workflow_failed(event, context):
+    order = event.get("order") or {}
+    error = event.get("workflow_error") or {}
+    order_id = order.get("order_id")
+    tenant_id = order.get("tenant_id")
+    if not order_id or not tenant_id:
+        raise ValueError("Missing order data for workflow failure")
+
+    error_name = error.get("Error", "WorkflowFailed")
+    status = "EXPIRED" if "Timeout" in error_name else "FAILED"
+    failed_at = _now_iso()
+    history_item = {
+        "event": status,
+        "timestamp": failed_at,
+        "status": status,
+        "step": order.get("workflow_step", "UNKNOWN"),
+        "actor": "system",
+        "error": error_name,
+    }
+    orders_table.update_item(
+        Key={"order_id": order_id},
+        UpdateExpression=(
+            "SET task_token = :null, #status = :status, "
+            "history = list_append(if_not_exists(history, :empty_list), :history_item)"
+        ),
+        ExpressionAttributeNames={"#status": "status"},
+        ExpressionAttributeValues={
+            ":null": None,
+            ":status": status,
+            ":history_item": [history_item],
+            ":empty_list": [],
+        },
+    )
+    _publish_event(
+        "order.state.changed",
+        {
+            "tenant_id": tenant_id,
+            "order_id": order_id,
+            "status": status,
+            "step": order.get("workflow_step", "UNKNOWN"),
+            "source": order.get("source", "web"),
+            "error": error_name,
+        },
+    )
+    return {"message": "Workflow failure recorded", "status": status}
 
 
 def list_products(event, context):
@@ -659,7 +957,10 @@ def rappi_notifier(event, context):
             "timestamp": _now_iso(),
         }
     ).encode("utf-8")
-    request = Request(RAPPI_API_URL, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    headers = {"Content-Type": "application/json"}
+    if RAPPI_SHARED_SECRET:
+        headers["X-Rappi-Secret"] = RAPPI_SHARED_SECRET
+    request = Request(RAPPI_API_URL, data=payload, headers=headers, method="POST")
     try:
         with urlopen(request, timeout=10) as resp:
             body = resp.read().decode("utf-8")

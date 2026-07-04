@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.serverless/
+.venv/
+venv/
+bucket-config.json
+.env

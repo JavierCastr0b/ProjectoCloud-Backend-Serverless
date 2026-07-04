@@ -1,13 +1,3 @@
-"""Carga recursos de Madam Tusan en S3 y productos en DynamoDB.
-
-Uso:
-    python3 load_products.py image-urls.txt bucket-config.json
-
-El archivo de entrada debe contener una URL de imagen por línea. El proceso es
-idempotente: las claves de S3 y los product_id son estables, por lo que volver
-a ejecutarlo actualiza los registros existentes en lugar de duplicarlos.
-"""
-
 import json
 import mimetypes
 import re
