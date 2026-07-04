@@ -4,6 +4,7 @@ import hmac
 import json
 import secrets
 import time
+from decimal import Decimal
 from http import HTTPStatus
 
 
@@ -28,8 +29,15 @@ def response(status_code, body):
             "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Tenant-Id",
             "Access-Control-Allow-Methods": "OPTIONS,GET,POST"
         },
-        "body": json.dumps(body)
+        "body": json.dumps(body, default=_json_default)
     }
+
+
+def _json_default(value):
+    """Convierte valores de DynamoDB a tipos serializables por JSON."""
+    if isinstance(value, Decimal):
+        return int(value) if value % 1 == 0 else float(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def get_header(event, name):

@@ -573,7 +573,8 @@ def list_products(event, context):
         else:
             result = products_table.scan()
         
-        return response(HTTPStatus.OK, {"products": result.get("Items", []), "count": len(result.get("Items", []))})
+        products = [_with_signed_image(item) for item in result.get("Items", [])]
+        return response(HTTPStatus.OK, {"products": products, "count": len(products)})
     except Exception as exc:
         return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
 
@@ -585,7 +586,51 @@ def get_product(event, context):
         product = result.get("Item")
         if not product:
             return response(HTTPStatus.NOT_FOUND, {"message": "Product not found"})
-        return response(HTTPStatus.OK, {"product": product})
+        return response(HTTPStatus.OK, {"product": _with_signed_image(product)})
+    except Exception as exc:
+        return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+
+
+def _signed_s3_url(key):
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=3600,
+    )
+
+
+def _with_signed_image(product):
+    product = dict(product)
+    image_key = product.get("image_key")
+    if image_key:
+        product["image_url"] = _signed_s3_url(image_key)
+    return product
+
+
+def list_assets(event, context):
+    """Devuelve logos, banners y categorías con URLs HTTPS temporales."""
+    try:
+        groups = {"branding": [], "banners": [], "sections": []}
+        paginator = s3.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=S3_BUCKET, Prefix="site-assets/")
+
+        for page in pages:
+            for item in page.get("Contents", []):
+                key = item["Key"]
+                parts = key.split("/", 2)
+                if len(parts) != 3 or parts[1] not in groups:
+                    continue
+                groups[parts[1]].append(
+                    {
+                        "key": key,
+                        "name": parts[2],
+                        "url": _signed_s3_url(key),
+                    }
+                )
+
+        for assets in groups.values():
+            assets.sort(key=lambda asset: asset["name"])
+        return response(HTTPStatus.OK, {"assets": groups, "expires_in": 3600})
     except Exception as exc:
         return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
 
@@ -715,5 +760,4 @@ Madam Tusán
         )
     except Exception as e:
         print(f"Error sending order notification: {e}")
-
 

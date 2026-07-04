@@ -163,6 +163,12 @@ functions:
       - httpApi:
           path: /products/{productId}
           method: get
+  listAssets:
+    handler: handler.list_assets
+    events:
+      - httpApi:
+          path: /assets
+          method: get
   taskCallback:
     handler: handler.submit_task_callback
     events:
