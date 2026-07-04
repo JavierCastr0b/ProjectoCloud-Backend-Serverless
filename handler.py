@@ -461,9 +461,10 @@ def task_handler(event, context):
     orders_table.update_item(
         Key={"order_id": order_id},
         UpdateExpression=(
-            "SET task_token = :token, workflow_step = :step, status = :status, "
+            "SET task_token = :token, workflow_step = :step, #status = :status, "
             "history = list_append(if_not_exists(history, :empty_list), :history_item)"
         ),
+        ExpressionAttributeNames={"#status": "status"},
         ExpressionAttributeValues={
             ":token": task_token,
             ":step": workflow_step,
@@ -508,9 +509,10 @@ def submit_task_callback(event, context):
         orders_table.update_item(
             Key={"order_id": order_id},
             UpdateExpression=(
-                "SET task_token = :null, workflow_step = :step, status = :status, "
+                "SET task_token = :null, workflow_step = :step, #status = :status, "
                 "history = list_append(if_not_exists(history, :empty_list), :history_item)"
             ),
+            ExpressionAttributeNames={"#status": "status"},
             ExpressionAttributeValues={
                 ":null": None,
                 ":step": step,
@@ -760,4 +762,3 @@ Madam Tusán
         )
     except Exception as e:
         print(f"Error sending order notification: {e}")
-
