@@ -175,6 +175,8 @@ def register_user(event, context):
             )
 
         hashed = hash_password(password)
+        email = body.get("email", "")
+        email_subscribed = body.get("email_subscribed", True)
         users_table.put_item(
             Item={
                 "tenant_user_id": _build_user_key(tenant_id, user_id),
@@ -182,15 +184,27 @@ def register_user(event, context):
                 "user_id": user_id,
                 "password_hash": hashed,
                 "role": role,
-                "email": body.get("email", ""),
+                "email": email,
                 "phone": body.get("phone", ""),
                 "address": body.get("address", ""),
                 "avatar_url": body.get("avatar_url", ""),
-                "email_subscribed": body.get("email_subscribed", True),
+                "email_subscribed": email_subscribed,
                 "created_at": _now_iso(),
             },
             ConditionExpression="attribute_not_exists(tenant_user_id)",
         )
+
+        if email_subscribed and email and SNS_ORDERS_TOPIC_ARN:
+            try:
+                sns.subscribe(
+                    TopicArn=SNS_ORDERS_TOPIC_ARN,
+                    Protocol="email",
+                    Endpoint=email,
+                    Attributes={"FilterPolicy": json.dumps({"tenant_id": [tenant_id]})},
+                )
+            except Exception:
+                pass
+
         return response(HTTPStatus.CREATED, {"message": "Customer registered"})
     except KeyError as exc:
         return response(HTTPStatus.BAD_REQUEST, {"message": f"Missing field: {exc.args[0]}"})
@@ -748,6 +762,10 @@ def _complete_active_step(order, actor):
             }
         ),
     )
+
+    if status == "DELIVER_COMPLETED":
+        _send_delivery_notification(tenant_id, order.get("created_by", ""), order_id)
+
     return status
 
 
@@ -1018,26 +1036,41 @@ def upload_avatar(event, context):
         return response(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
 
 
-def _send_order_notification(tenant_id, user_id, order_id, items):
-    """Envía notificación por email de confirmación de orden"""
+def _send_order_email(tenant_id, user_id, subject, message):
+    """Envía un correo al cliente dueño de la orden, si sigue suscrito"""
     if not SNS_ORDERS_TOPIC_ARN:
         return
-    
+
     try:
         user_key = _build_user_key(tenant_id, user_id)
         result = users_table.get_item(Key={"tenant_user_id": user_key})
         user = result.get("Item", {})
-        
+
         if not user.get("email_subscribed"):
             return
-        
+
         email = user.get("email", "")
         if not email:
             return
-        
-        items_str = "\n".join([f"- {item.get('product_id', 'Unknown')}: {item.get('quantity', 1)}x ${item.get('price', 0)}" for item in items])
-        
-        message = f"""
+
+        sns.publish(
+            TopicArn=SNS_ORDERS_TOPIC_ARN,
+            Subject=subject,
+            Message=message,
+            MessageAttributes={
+                "tenant_id": {"DataType": "String", "StringValue": tenant_id},
+                "user_email": {"DataType": "String", "StringValue": email}
+            }
+        )
+    except Exception as e:
+        print(f"Error sending order email: {e}")
+
+
+def _send_order_notification(tenant_id, user_id, order_id, items):
+    """Envía notificación por email de confirmación de orden"""
+    items_str = "\n".join([f"- {item.get('product_id', 'Unknown')}: {item.get('quantity', 1)}x ${item.get('price', 0)}" for item in items])
+
+    message = f"""
 ¡Gracias por tu pedido!
 
 Número de orden: {order_id}
@@ -1051,15 +1084,20 @@ Tu pedido será preparado pronto. Puedes rastrear el estado en tu cuenta.
 Saludos,
 Madam Tusán
 """
-        
-        sns.publish(
-            TopicArn=SNS_ORDERS_TOPIC_ARN,
-            Subject=f"Confirmación de pedido #{order_id}",
-            Message=message,
-            MessageAttributes={
-                "tenant_id": {"DataType": "String", "StringValue": tenant_id},
-                "user_email": {"DataType": "String", "StringValue": email}
-            }
-        )
-    except Exception as e:
-        print(f"Error sending order notification: {e}")
+    _send_order_email(tenant_id, user_id, f"Confirmación de pedido #{order_id}", message)
+
+
+def _send_delivery_notification(tenant_id, user_id, order_id):
+    """Envía notificación por email cuando el pedido fue entregado"""
+    message = f"""
+¡Tu pedido fue entregado!
+
+Número de orden: {order_id}
+Estado: Entregado
+
+Por favor confirma la recepción en tu cuenta para cerrar el pedido.
+
+Saludos,
+Madam Tusán
+"""
+    _send_order_email(tenant_id, user_id, f"Pedido #{order_id} entregado", message)

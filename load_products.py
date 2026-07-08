@@ -15,8 +15,6 @@ import boto3
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".svg"}
 TIMESTAMP_SUFFIX = re.compile(r"-\d{18}$")
 
-# Categorías y precios de referencia para la demo. Se pueden ajustar sin
-# cambiar los identificadores ni volver a cargar las imágenes.
 PRODUCT_DATA = {
     "chaufa-de-pollo": ("chaufas", 32),
     "wantan-clasico": ("dim-sums", 18),
