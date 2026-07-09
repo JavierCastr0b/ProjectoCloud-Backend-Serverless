@@ -160,12 +160,15 @@ Todo evento publicado también se guarda en `OrderEventsTable` para auditoría
 
 Tópico `madamtusan-backend-orders-notifications-{stage}`:
 
-- Suscripción por email fija a `ADMIN_EMAIL` (definida en `serverless.yml`).
-- Cada cliente puede suscribir/desuscribir su propio email vía
-  `POST /users/email-subscription` (filtrado por `tenant_id` con
-  `FilterPolicy`).
+- Cada cliente se suscribe automáticamente con su propio email al
+  registrarse (`POST /auth/register`), y puede suscribirse/desuscribirse
+  después vía `POST /users/email-subscription`. Ambas rutas usan
+  `FilterPolicy` por `tenant_id` para que cada cliente solo reciba las
+  notificaciones de su propio tenant.
 - `_send_order_notification` envía un email de confirmación al cliente cuando
   crea una orden (si está suscrito).
+- `_send_delivery_notification` envía un email al cliente cuando su pedido
+  llega al estado `DELIVER_COMPLETED`.
 
 ## Integración multi-nube (Rappi)
 
@@ -256,7 +259,6 @@ Solo funciona si el pedido está en `WAITING_RECEIVE`. Responde:
 | `RAPPI_API_URL` | URL de la API externa que recibe los cambios de estado |
 | `RAPPI_SHARED_SECRET` | Secreto compartido con la otra nube (`X-Rappi-Secret`) |
 | `TENANT_ID` | Tenant por defecto (`madamtusan`) |
-| `ADMIN_EMAIL` | Email suscrito al tópico SNS de notificaciones |
 
 ## Despliegue
 
@@ -265,7 +267,6 @@ npm install -g serverless
 cd /home/toritosomali/CLOUD/ProjectoCloud-Backend-Serverless
 export RAPPI_API_URL="https://tu-api-externa.example.com/estado"
 export RAPPI_SHARED_SECRET="un-secreto-largo"
-export ADMIN_EMAIL="admin@madamtusan.com"
 serverless deploy --stage dev
 ```
 
