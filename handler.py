@@ -78,16 +78,40 @@ def _duration_seconds(started_at, completed_at):
     return max(0, int((end - start).total_seconds()))
 
 
-def _normalize_order_items(items):
-    normalized = []
+def _resolve_order_items(items):
+    """Resuelve cada item contra ProductsTable: el cliente solo manda
+    product_id y quantity, el nombre y precio siempre salen del catálogo."""
+    if not items:
+        raise ValueError("Order items are required")
+
+    resolved = []
     for item in items:
-        normalized_item = dict(item)
-        if "price" in normalized_item:
-            normalized_item["price"] = Decimal(str(normalized_item["price"]))
-        if "quantity" in normalized_item:
-            normalized_item["quantity"] = int(normalized_item["quantity"])
-        normalized.append(normalized_item)
-    return normalized
+        product_id = item.get("product_id")
+        if not product_id:
+            raise ValueError("Each item requires a product_id")
+
+        try:
+            quantity = int(item.get("quantity", 1))
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid quantity for product_id: {product_id}")
+        if quantity < 1:
+            raise ValueError(f"Invalid quantity for product_id: {product_id}")
+
+        product = products_table.get_item(Key={"product_id": product_id}).get("Item")
+        if not product:
+            raise ValueError(f"Unknown product_id: {product_id}")
+        if not product.get("active", True):
+            raise ValueError(f"Product is not available: {product_id}")
+
+        resolved.append(
+            {
+                "product_id": product_id,
+                "name": product["name"],
+                "price": product["price"],
+                "quantity": quantity,
+            }
+        )
+    return resolved
 
 
 def _json_decimal(value):
@@ -422,10 +446,7 @@ def update_profile(event, context):
 
 
 def _create_order_record(tenant_id, user_id, source, items):
-    if not items:
-        raise ValueError("Order items are required")
-
-    items = _normalize_order_items(items)
+    items = _resolve_order_items(items)
     created_at = _now_iso()
     order_id = str(uuid.uuid4())
     order = {

@@ -190,10 +190,12 @@ Content-Type: application/json
   "tenant_id": "madamtusan",
   "customer_id": "rappi-cliente-123",
   "items": [
-    { "product_id": "chaufa-de-pollo", "name": "Chaufa De Pollo", "quantity": 1, "price": 32 }
+    { "product_id": "chaufa-de-pollo", "quantity": 1 }
   ]
 }
 ```
+
+Cada item solo lleva `product_id` y `quantity` — el `name` y el `price` **siempre** se resuelven contra `ProductsTable` en AWS (`_resolve_order_items`), nunca se confía en lo que mande el cliente. Si el `product_id` no existe en el catálogo o el producto está inactivo (`active: false`), la orden se rechaza con `400`.
 
 Respuesta `201`:
 
